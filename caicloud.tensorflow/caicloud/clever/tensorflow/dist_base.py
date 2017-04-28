@@ -20,19 +20,21 @@ import time
 from datetime import datetime
 import tensorflow as tf
 from caicloud.clever.tensorflow import model_exporter
+import os
 
-tf.app.flags.DEFINE_integer("max_steps",
-                            1,
-                            "maximum train steps.")
-tf.app.flags.DEFINE_string("logdir",
-                           "/tmp/caicloud-dist-tf",
-                           "saves checkpoints and summaries directory path.")
-tf.app.flags.DEFINE_integer("save_checkpoints_secs", 60,
-                            "save checkpoints after every special seconds")
-tf.app.flags.DEFINE_integer("save_summaries_secs", 120,
-                            "save summaries after every special seconds")
+_USE_DEFAULT = 0
 
-FLAGS = tf.app.flags.FLAGS
+class RunConfig(object):
+    def __init__(self):
+        self.is_chief = True
+        self.use_gpu = False
+        self.sync = False
+        self.max_steps = int(os.getenv("TF_MAX_STEPS", "1"))
+        self.logdir = os.getenv("TF_LOGDIR", "/tmp/caicloud-dist-tf")
+        self.save_checkpoints_secs = int(os.getenv("TF_SAVE_CHECKPOINTS_SECS", "600"))
+        self.save_summaries_steps = int(os.getenv("TF_SAVE_SUMMARIES_STEPS", "100"))
+
+cfg = RunConfig()
 
 class ModelFnHandler(object):
     """model_fn 函数返回的一些模型信息。"""
@@ -41,7 +43,8 @@ class ModelFnHandler(object):
                  global_step=None,
                  optimizer=None,
                  model_export_spec=None,
-                 model_metric_ops=None):
+                 model_metric_ops=None,
+                 summary_op=_USE_DEFAULT):
         """创建一个 ModelFnHandler 对象。
 
         分布式 TensorFlow 运行器 DistTensorflowRunner 的模型构建方法 model_fn 的返回值
@@ -73,6 +76,8 @@ class ModelFnHandler(object):
         if (model_metric_ops is not None) and (not isinstance(model_metric_ops, dict)):
             raise ValueError('model_export_spec must be a None or dict.')
         self._model_metric_ops = model_metric_ops
+        
+        self._summary_op = summary_op
 
     @property
     def global_step(self):
@@ -89,6 +94,10 @@ class ModelFnHandler(object):
     @property
     def model_metric_ops(self):
         return self._model_metric_ops
+
+    @property
+    def summary_op(self):
+        return self._summary_op
 
 
 class DistTensorflowRunner(object):
@@ -170,6 +179,8 @@ class DistTensorflowRunner(object):
         if model_fn_handler.model_export_spec is not None:
             self._model_exporter = model_exporter.ModelExporter(model_fn_handler.model_export_spec)
 
+        return model_fn_handler
+
     
     def run(self, train_fn):
         """执行分布式 TensorFlow 训练。
@@ -186,26 +197,35 @@ class DistTensorflowRunner(object):
 
         g = tf.Graph()
         with g.as_default():
-            self._call_model_fn()
+            model_fn_handler = self._call_model_fn()
+            
 
             saver = tf.train.Saver()
-            summary_op = tf.summary.merge_all()
+            summary_op = model_fn_handler.summary_op
+            if summary_op == _USE_DEFAULT:
+                summary_op = tf.summary.merge_all()
             init_op = tf.global_variables_initializer()
 
             init_fn = None
             if self._gen_init_fn is not None:
-                init_fn = self._gen_init_fn()
+                customed_init_fn = self._gen_init_fn()
+                if customed_init_fn is not None:
+                    def init_fn(sess):
+                        scaffold = tf.train.Scaffold(
+                            init_op = init_op,
+                            saver = saver
+                        )
+                        customed_init_fn(scaffold, sess)
 
-        logdir = FLAGS.logdir
         sv = tf.train.Supervisor(
-            logdir=logdir,
+            logdir=cfg.logdir,
             graph=g,
             init_op=init_op,
             summary_op=summary_op,
             saver=saver,
             global_step=self._global_step,
-            save_model_secs=FLAGS.save_checkpoints_secs,
-            save_summaries_secs=FLAGS.save_summaries_secs,
+            save_model_secs=cfg.save_checkpoints_secs,
+            save_summaries_secs=cfg.save_summaries_steps,
             init_fn=init_fn)
         # Get a TensorFlow session managed by the supervisor.
         sess = sv.prepare_or_wait_for_session('')
@@ -214,11 +234,10 @@ class DistTensorflowRunner(object):
         print("Training begins @ {0}".format(str(datetime.now())))
 
         # Use the session to train the graph.
-        sess.run(init_op)
         step = 0
         while not sv.should_stop():
             step = sess.run(self._global_step)
-            if step > FLAGS.max_steps:
+            if step > cfg.max_steps:
                 break
             should_stop = train_fn(sess, step)
             if should_stop:
